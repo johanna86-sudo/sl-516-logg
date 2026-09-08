@@ -10,6 +10,7 @@ import csv
 import json
 import os
 import sys
+import time
 from datetime import datetime, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -36,10 +37,21 @@ SUMMARY_FILE = DATA_DIR / "summary.csv"
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def http_get_json(url: str):
-    req = urllib.request.Request(url, headers={"User-Agent": "sl-516-monitor/1.0"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def http_get_json(url: str, attempts: int = 3, backoff_seconds: float = 5.0):
+    """Hämtar JSON från en URL, med några återförsök om SL:s server svarar
+    med ett tillfälligt fel (t.ex. HTTP 500)."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(url, headers={"User-Agent": "sl-516-monitor/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            last_error = e
+            print(f"Försök {attempt}/{attempts} misslyckades ({e}), försöker igen om {backoff_seconds}s...")
+            if attempt < attempts:
+                time.sleep(backoff_seconds)
+    raise last_error
 
 
 def get_site_id(stop_name: str) -> int:
@@ -168,50 +180,3 @@ def classify_day(date_str: str):
             "last_seen": last_row["poll_time"],
             "last_state": last_row["state"],
             "outcome": outcome,
-        })
-    return results
-
-
-def rewrite_summary_for_date(date_str: str):
-    new_rows = classify_day(date_str)
-    if not new_rows:
-        return
-
-    existing = []
-    if SUMMARY_FILE.exists():
-        with SUMMARY_FILE.open(newline="", encoding="utf-8") as f:
-            existing = list(csv.DictReader(f))
-
-    existing = [r for r in existing if r["date"] != date_str]
-    existing.extend(new_rows)
-    existing.sort(key=lambda r: (r["date"], r["scheduled"]))
-
-    with SUMMARY_FILE.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["date", "scheduled", "first_seen", "last_seen", "last_state", "outcome"])
-        writer.writeheader()
-        writer.writerows(existing)
-
-
-def main():
-    now_local = datetime.now(TZ)
-
-    if not in_monitoring_window(now_local):
-        print(f"Utanför bevakningsfönstret ({now_local.isoformat()}) – gör inget.")
-        return
-
-    try:
-        site_id = get_site_id(STOP_NAME)
-        departures = fetch_matching_departures(site_id)
-    except (urllib.error.URLError, RuntimeError) as e:
-        print(f"Fel vid hämtning: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    raw_file = append_raw_rows(now_local, departures)
-    print(f"Loggade {len(departures)} matchande avgångar till {raw_file}")
-
-    rewrite_summary_for_date(now_local.strftime("%Y-%m-%d"))
-    print("Uppdaterade data/summary.csv")
-
-
-if __name__ == "__main__":
-    main()
