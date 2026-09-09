@@ -4,6 +4,25 @@ Loggar avgångar för buss 516 mot Häggvik vid Sergels torg.
 
 Använder SL:s öppna "Transport"-API (inget API-nyckel behövs):
 https://www.trafiklab.se/api/our-apis/sl/transport/
+
+Körs en gång per anrop (tänkt att triggas av ett schemalagt GitHub Actions-jobb
+var 3:e minut). Skriptet:
+  1. Struntar i att göra något alls om klockan i Stockholm inte är inom
+     bevakningsfönstret (default 15:45-18:15, vardagar).
+  2. Slår upp siteId för hållplatsen (cachas i data/site_cache.json).
+  3. Hämtar aktuella avgångar för hållplatsen, filtrerar ut linje 516 mot
+     Häggvik.
+  4. Sparar en rad per matchande avgång i data/raw/<datum>.csv (en "ögonblicksbild").
+  5. Bygger om dagens sammanfattningsrad i data/summary.csv, där varje unik
+     schemalagd avgång klassas som:
+       - RAN_ON_TIME / RAN_DELAYED_<n>min  -> avgången sågs ända fram (rimligt
+         nära sin förväntade tid, staten gick inte till NOTEXPECTED igen)
+       - VANISHED  -> avgången syntes i tavlan med ett framtida klockslag,
+         men försvann helt innan den klocktiden nåddes, utan att någonsin
+         markeras som avgången
+       - CANCELLED -> SL:s API markerade den uttryckligen som inställd
+       - NEVER_SEEN -> fanns i schemat men syntes aldrig alls i tavlan under
+         mätfönstret (mest konservativ variant av "försvinner")
 """
 
 import csv
@@ -18,12 +37,15 @@ from zoneinfo import ZoneInfo
 import urllib.request
 import urllib.error
 
+# ---------------------------------------------------------------------------
+# Konfiguration – ändra här om du vill bevaka en annan linje/hållplats/fönster
+# ---------------------------------------------------------------------------
 STOP_NAME = "Sergels torg"
 LINE_DESIGNATION = "516"
-DESTINATION_MATCH = "Häggvik"
+DESTINATION_MATCH = "Häggvik"  # substräng, skiftlägesokänslig
 WINDOW_START = dtime(15, 45)
 WINDOW_END = dtime(18, 15)
-WEEKDAYS_ONLY = True
+WEEKDAYS_ONLY = True  # mån-fre
 
 TZ = ZoneInfo("Europe/Stockholm")
 BASE_URL = "https://transport.integration.sl.se/v1"
@@ -55,6 +77,7 @@ def http_get_json(url: str, attempts: int = 3, backoff_seconds: float = 5.0):
 
 
 def get_site_id(stop_name: str) -> int:
+    """Slår upp siteId för en hållplats, med enkel fil-cache."""
     if SITE_CACHE_FILE.exists():
         cache = json.loads(SITE_CACHE_FILE.read_text())
         if stop_name in cache:
@@ -69,6 +92,7 @@ def get_site_id(stop_name: str) -> int:
             match = site
             break
     if match is None:
+        # fallback: substräng-matchning om exakt namn inte hittas
         for site in sites:
             if stop_name.strip().lower() in site.get("name", "").strip().lower():
                 match = site
@@ -82,7 +106,7 @@ def get_site_id(stop_name: str) -> int:
 
 
 def in_monitoring_window(now_local: datetime) -> bool:
-    if WEEKDAYS_ONLY and now_local.weekday() >= 5:
+    if WEEKDAYS_ONLY and now_local.weekday() >= 5:  # 5=lör, 6=sön
         return False
     return WINDOW_START <= now_local.time() <= WINDOW_END
 
@@ -125,6 +149,7 @@ def append_raw_rows(poll_time_local: datetime, departures: list):
 
 
 def classify_day(date_str: str):
+    """Läser dagens raw-fil och klassar varje unik schemalagd avgång."""
     raw_file = RAW_DIR / f"{date_str}.csv"
     if not raw_file.exists():
         return []
@@ -147,6 +172,8 @@ def classify_day(date_str: str):
         last_row = rows[-1]
         last_seen_dt = datetime.fromisoformat(last_row["poll_time"])
 
+        # Den senast kända förväntade avgångstiden (eller schemalagd, om
+        # ingen "expected"-tid någonsin sågs).
         last_expected_raw = last_row["expected"] or sched
         try:
             last_expected_dt = datetime.fromisoformat(last_expected_raw).replace(tzinfo=TZ)
@@ -156,8 +183,14 @@ def classify_day(date_str: str):
         if "CANCELLED" in states_seen:
             outcome = "CANCELLED"
         elif sched_dt and sched_dt > now_local:
-            outcome = "PENDING"
+            outcome = "PENDING"  # avgången ligger fortfarande i framtiden
         else:
+            # Nyckel-heuristik: om avgången slutade synas i tavlan minst en
+            # hel pollningscykel (>5 min) INNAN den senast kända förväntade
+            # avgångstiden, och den aldrig dök upp igen -> den försvann
+            # tyst, precis så som beskrivits (ingen CANCELLED-status, bara
+            # borta). Om den istället sågs ända fram mot sin avgångstid
+            # antar vi att den faktiskt gick.
             gap_min = None
             if last_expected_dt:
                 gap_min = (last_expected_dt - last_seen_dt).total_seconds() / 60
@@ -180,3 +213,59 @@ def classify_day(date_str: str):
             "last_seen": last_row["poll_time"],
             "last_state": last_row["state"],
             "outcome": outcome,
+        })
+    return results
+
+
+def rewrite_summary_for_date(date_str: str):
+    new_rows = classify_day(date_str)
+    if not new_rows:
+        return
+
+    existing = []
+    if SUMMARY_FILE.exists():
+        with SUMMARY_FILE.open(newline="", encoding="utf-8") as f:
+            existing = list(csv.DictReader(f))
+
+    existing = [r for r in existing if r["date"] != date_str]
+    existing.extend(new_rows)
+    existing.sort(key=lambda r: (r["date"], r["scheduled"]))
+
+    with SUMMARY_FILE.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["date", "scheduled", "first_seen", "last_seen", "last_state", "outcome"])
+        writer.writeheader()
+        writer.writerows(existing)
+
+
+def main():
+    now_local = datetime.now(TZ)
+
+    if not in_monitoring_window(now_local):
+        print(f"Utanför bevakningsfönstret ({now_local.isoformat()}) – gör inget.")
+        return
+
+    try:
+        site_id = get_site_id(STOP_NAME)
+        departures = fetch_matching_departures(site_id)
+    except RuntimeError as e:
+        # Ett konfigurationsfel (t.ex. hållplatsen hittades inte) - värt att
+        # synas som ett rött, riktigt fel.
+        print(f"Konfigurationsfel: {e}", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+        # SL:s server svarade inte som förväntat även efter återförsök.
+        # Detta är ofta tillfälligt - vi loggar det tydligt men låter INTE
+        # hela jobbet räknas som misslyckat, eftersom nästa pollning om
+        # 3 minuter oftast löser det själv.
+        print(f"Kunde inte hämta data från SL just nu, hoppar över denna pollning: {e}")
+        return
+
+    raw_file = append_raw_rows(now_local, departures)
+    print(f"Loggade {len(departures)} matchande avgångar till {raw_file}")
+
+    rewrite_summary_for_date(now_local.strftime("%Y-%m-%d"))
+    print("Uppdaterade data/summary.csv")
+
+
+if __name__ == "__main__":
+    main()
