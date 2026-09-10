@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Bygger om data/summary.csv helt från grunden, baserat på ALLA filer i
-data/raw/ och den senaste klassificeringslogiken i monitor.py.
+Bygger om summary.csv för ALLA bevakningar (se WATCHES i monitor.py) helt
+från grunden, baserat på filerna i data/<nyckel>/raw/ och den senaste
+klassificeringslogiken.
 
 Använd den här när logiken i monitor.py har ändrats och du vill att hela
-historiken ska vara beräknad på samma, senaste sätt - istället för att
-manuellt radera eller välja bort enskilda datum.
+historiken ska vara beräknad på samma, senaste sätt.
 
 Kör lokalt: python rebuild_summary.py
 Kör i GitHub: via workflowen "Bygg om sammanfattning" (manuell knapp).
@@ -13,27 +13,29 @@ Kör i GitHub: via workflowen "Bygg om sammanfattning" (manuell knapp).
 
 import csv
 
-from monitor import RAW_DIR, SUMMARY_FILE, classify_day
-
-FIELDNAMES = [
-    "date", "scheduled", "first_seen", "last_seen",
-    "last_state", "outcome", "physically_confirmed",
-]
+from monitor import WATCHES, SUMMARY_FIELDNAMES, raw_dir_for, summary_file_for, classify_day
 
 
-def main():
-    raw_files = sorted(RAW_DIR.glob("*.csv"))
+def rebuild_watch(watch: dict):
+    raw_files = sorted(raw_dir_for(watch["key"]).glob("*.csv"))
     all_rows = []
     for raw_file in raw_files:
-        date_str = raw_file.stem  # t.ex. "2026-09-09" från "2026-09-09.csv"
-        all_rows.extend(classify_day(date_str))
+        date_str = raw_file.stem
+        all_rows.extend(classify_day(date_str, watch))
 
-    with SUMMARY_FILE.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+    summary_file = summary_file_for(watch["key"])
+    summary_file.parent.mkdir(parents=True, exist_ok=True)
+    with summary_file.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=SUMMARY_FIELDNAMES)
         writer.writeheader()
         writer.writerows(all_rows)
 
-    print(f"Byggde om summary.csv: {len(all_rows)} rader från {len(raw_files)} dagar.")
+    print(f"[{watch['key']}] Byggde om summary.csv: {len(all_rows)} rader från {len(raw_files)} dagar.")
+
+
+def main():
+    for watch in WATCHES:
+        rebuild_watch(watch)
 
 
 if __name__ == "__main__":
