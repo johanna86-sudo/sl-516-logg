@@ -2,8 +2,12 @@ name: Logga buss 516 mot Häggvik
 
 on:
   schedule:
-    - cron: "*/3 13-18 * * 1-5"
-  workflow_dispatch: {}
+    # Var 3:e minut, 13:00-18:59 UTC, mån-fre.
+    # Täcker svensk lokal tid 14:00-19:59 (vintertid) och 15:00-20:59
+    # (sommartid) — själva fönstret 15:45-18:15 lokal tid filtreras sedan
+    # exakt inuti monitor.py oavsett sommar-/vintertid.
+    - cron: "*/5 13-18 * * 1-5"
+  workflow_dispatch: {}  # gör det möjligt att köra manuellt för test
 
 permissions:
   contents: write
