@@ -209,6 +209,14 @@ def classify_day(date_str: str):
             continue
 
         states_seen = [r["state"] for r in rows]
+        # De här tre statusarna är rimligen bokstavliga fysiska observationer
+        # (fordonet sågs vid hållplatsen / lämnade den / passerade den) -
+        # till skillnad från t.ex. EXPECTED som bara är en prognos. OBS:
+        # SL:s egen dokumentation förklarar inte formellt vad ATSTOP innebär,
+        # så det här är en indikation, inte en garanterad bekräftelse.
+        physically_confirmed = any(
+            s in ("ATSTOP", "DEPARTED", "PASSED") for s in states_seen
+        )
         last_row = rows[-1]
         last_seen_dt = datetime.fromisoformat(last_row["poll_time"])
 
@@ -248,6 +256,7 @@ def classify_day(date_str: str):
             "last_seen": last_row["poll_time"],
             "last_state": last_row["state"],
             "outcome": outcome,
+            "physically_confirmed": physically_confirmed,
         })
     return results
 
@@ -267,7 +276,7 @@ def rewrite_summary_for_date(date_str: str):
     existing.sort(key=lambda r: (r["date"], r["scheduled"]))
 
     with SUMMARY_FILE.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["date", "scheduled", "first_seen", "last_seen", "last_state", "outcome"])
+        writer = csv.DictWriter(f, fieldnames=["date", "scheduled", "first_seen", "last_seen", "last_state", "outcome", "physically_confirmed"])
         writer.writeheader()
         writer.writerows(existing)
 
