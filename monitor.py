@@ -30,7 +30,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -134,6 +134,16 @@ def append_raw_rows(poll_time_local: datetime, departures: list):
                 "poll_time", "scheduled", "expected", "state",
                 "destination", "journey_state", "journey_id",
             ])
+        if not departures:
+            # Skriv ändå en "hjärtslag"-rad så vi vet att en mätning
+            # faktiskt gjordes vid den här tidpunkten, även om inga
+            # matchande avgångar syntes just då. Det är avgörande för att
+            # senare kunna avgöra om en avgång verkligen försvann eller om
+            # vi bara inte hann mäta i tid (se classify_day).
+            writer.writerow([
+                poll_time_local.isoformat(timespec="seconds"),
+                "_HEARTBEAT_", "", "", "", "", "",
+            ])
         for dep in departures:
             journey = dep.get("journey", {}) or {}
             writer.writerow([
@@ -149,16 +159,36 @@ def append_raw_rows(poll_time_local: datetime, departures: list):
 
 
 def classify_day(date_str: str):
-    """Läser dagens raw-fil och klassar varje unik schemalagd avgång."""
+    """Läser dagens raw-fil och klassar varje unik schemalagd avgång.
+
+    Metod: för varje avgång som slutar synas i tavlan INNAN sin egen
+    förväntade avgångstid, kollar vi om det faktiskt gjordes en ny mätning
+    EFTER den tidpunkten (oavsett hur långt senare - GitHub Actions kör
+    inte alltid exakt var 3:e minut). Om avgången fortfarande saknades vid
+    den mätningen har vi goda belägg för att den verkligen försvann. Om
+    ingen mätning hann göras efter dess avgångstid innan fönstret stängde
+    kan vi inte veta säkert, och den märks UNCERTAIN istället för att
+    gissa.
+    """
     raw_file = RAW_DIR / f"{date_str}.csv"
     if not raw_file.exists():
         return []
 
-    by_scheduled = {}
+    all_rows = []
     with raw_file.open(newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            sched = row["scheduled"]
-            by_scheduled.setdefault(sched, []).append(row)
+        all_rows = list(csv.DictReader(f))
+
+    # Alla tidpunkter då en mätning verkligen gjordes (oavsett om något
+    # matchade), oavsett hur oregelbundet GitHub kört dem.
+    poll_times = sorted({
+        datetime.fromisoformat(r["poll_time"]) for r in all_rows
+    })
+
+    by_scheduled = {}
+    for row in all_rows:
+        if row["scheduled"] == "_HEARTBEAT_":
+            continue
+        by_scheduled.setdefault(row["scheduled"], []).append(row)
 
     now_local = datetime.now(TZ)
     results = []
@@ -172,8 +202,6 @@ def classify_day(date_str: str):
         last_row = rows[-1]
         last_seen_dt = datetime.fromisoformat(last_row["poll_time"])
 
-        # Den senast kända förväntade avgångstiden (eller schemalagd, om
-        # ingen "expected"-tid någonsin sågs).
         last_expected_raw = last_row["expected"] or sched
         try:
             last_expected_dt = datetime.fromisoformat(last_expected_raw).replace(tzinfo=TZ)
@@ -183,28 +211,25 @@ def classify_day(date_str: str):
         if "CANCELLED" in states_seen:
             outcome = "CANCELLED"
         elif sched_dt and sched_dt > now_local:
-            outcome = "PENDING"  # avgången ligger fortfarande i framtiden
+            outcome = "PENDING"
+        elif last_expected_dt and last_seen_dt >= last_expected_dt - timedelta(minutes=2):
+            # Sågs ända fram till (eller nästan fram till) sin egen
+            # förväntade avgångstid - stark signal att den faktiskt gick.
+            delay_min = None
+            if sched_dt and last_expected_dt:
+                delay_min = round((last_expected_dt - sched_dt).total_seconds() / 60)
+            if delay_min is not None and delay_min > 2:
+                outcome = f"RAN_DELAYED_{delay_min}min"
+            else:
+                outcome = "RAN_ON_TIME"
         else:
-            # Nyckel-heuristik: om avgången slutade synas i tavlan minst en
-            # hel pollningscykel (>5 min) INNAN den senast kända förväntade
-            # avgångstiden, och den aldrig dök upp igen -> den försvann
-            # tyst, precis så som beskrivits (ingen CANCELLED-status, bara
-            # borta). Om den istället sågs ända fram mot sin avgångstid
-            # antar vi att den faktiskt gick.
-            gap_min = None
-            if last_expected_dt:
-                gap_min = (last_expected_dt - last_seen_dt).total_seconds() / 60
-
-            if gap_min is not None and gap_min > 5:
+            # Försvann innan sin egen förväntade tid. Kolla om vi hann
+            # mäta igen EFTER den tidpunkten innan fönstret stängde.
+            later_polls = [t for t in poll_times if last_expected_dt and t > last_expected_dt]
+            if later_polls:
                 outcome = "VANISHED"
             else:
-                delay_min = None
-                if sched_dt and last_expected_dt:
-                    delay_min = round((last_expected_dt - sched_dt).total_seconds() / 60)
-                if delay_min is not None and delay_min > 2:
-                    outcome = f"RAN_DELAYED_{delay_min}min"
-                else:
-                    outcome = "RAN_ON_TIME"
+                outcome = "UNCERTAIN_WINDOW_ENDED"
 
         results.append({
             "date": date_str,
