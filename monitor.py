@@ -43,8 +43,12 @@ import urllib.error
 STOP_NAME = "Sergels torg"
 LINE_DESIGNATION = "516"
 DESTINATION_MATCH = "Häggvik"  # substräng, skiftlägesokänslig
-WINDOW_START = dtime(15, 45)
-WINDOW_END = dtime(18, 15)
+WINDOW_START = dtime(15, 15)  # 15 min innan första avgången (15:30)
+WINDOW_END = dtime(18, 50)    # mäter en bit efter SCOPE_END, för att hinna
+                                # bekräfta utfallet för den sista avgången
+SCOPE_END = dtime(18, 30)     # avgångar planerade efter detta räknas inte
+                                # med i sammanfattningen - sista bussen går
+                                # 18:30 enligt tidtabellen
 WEEKDAYS_ONLY = True  # mån-fre
 
 TZ = ZoneInfo("Europe/Stockholm")
@@ -197,6 +201,12 @@ def classify_day(date_str: str):
             sched_dt = datetime.fromisoformat(sched).replace(tzinfo=TZ)
         except ValueError:
             sched_dt = None
+
+        if sched_dt and sched_dt.time() > SCOPE_END:
+            # Ligger utanför det fönster vi faktiskt bevakar (t.ex. en
+            # avgång kl 18:30 som bara syntes för att tavlan tittar en bit
+            # framåt i tiden) - tas inte med i sammanfattningen.
+            continue
 
         states_seen = [r["state"] for r in rows]
         last_row = rows[-1]
