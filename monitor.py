@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 """
-Loggar avgångar för buss 516 mot Häggvik vid Sergels torg.
+Loggar avgångar för buss 516, i två riktningar:
+  - "afternoon": Sergels torg -> Häggvik, 15:15-18:30
+  - "morning":   Silverdals kapell -> stan, 06:00-09:00
 
 Använder SL:s öppna "Transport"-API (inget API-nyckel behövs):
 https://www.trafiklab.se/api/our-apis/sl/transport/
 
-Körs en gång per anrop (tänkt att triggas av ett schemalagt GitHub Actions-jobb
-var 3:e minut). Skriptet:
-  1. Struntar i att göra något alls om klockan i Stockholm inte är inom
-     bevakningsfönstret (default 15:45-18:15, vardagar).
-  2. Slår upp siteId för hållplatsen (cachas i data/site_cache.json).
-  3. Hämtar aktuella avgångar för hållplatsen, filtrerar ut linje 516 mot
-     Häggvik.
-  4. Sparar en rad per matchande avgång i data/raw/<datum>.csv (en "ögonblicksbild").
-  5. Bygger om dagens sammanfattningsrad i data/summary.csv, där varje unik
-     schemalagd avgång klassas som:
-       - RAN_ON_TIME / RAN_DELAYED_<n>min  -> avgången sågs ända fram (rimligt
-         nära sin förväntade tid, staten gick inte till NOTEXPECTED igen)
-       - VANISHED  -> avgången syntes i tavlan med ett framtida klockslag,
-         men försvann helt innan den klocktiden nåddes, utan att någonsin
-         markeras som avgången
+Körs en gång per anrop (triggas av ett schemalagt GitHub Actions-jobb).
+Skriptet:
+  1. Går igenom varje bevakning i WATCHES. Struntar i en bevakning om
+     klockan i Stockholm inte är inom just dess fönster just nu.
+  2. Slår upp siteId för hållplatsen (cachas i data/site_cache.json,
+     delad mellan bevakningarna).
+  3. Hämtar aktuella avgångar för hållplatsen, filtrerar ut linje 516 (och
+     ev. destination).
+  4. Sparar en rad per matchande avgång i data/<nyckel>/raw/<datum>.csv.
+  5. Bygger om dagens sammanfattningsrad i data/<nyckel>/summary.csv, där
+     varje unik schemalagd avgång klassas som:
+       - RAN_ON_TIME / RAN_DELAYED_<n>min  -> avgången sågs ända fram mot
+         sin egen förväntade avgångstid
+       - VANISHED  -> avgången försvann innan sin förväntade tid, OCH vi
+         bekräftade via en senare mätning att den fortfarande saknades
+       - UNCERTAIN_WINDOW_ENDED -> avgången försvann innan sin förväntade
+         tid, men fönstret stängde innan vi hann bekräfta om den kom sent
+         eller aldrig kom
        - CANCELLED -> SL:s API markerade den uttryckligen som inställd
-       - NEVER_SEEN -> fanns i schemat men syntes aldrig alls i tavlan under
-         mätfönstret (mest konservativ variant av "försvinner")
+     Varje rad har också physically_confirmed (True/False) - om SL någon
+     gång rapporterade fordonet som ATSTOP/DEPARTED/PASSED för just den
+     avgången. Indikation, inte garanti (SL dokumenterar inte fältet).
 """
 
 import csv
@@ -38,17 +44,29 @@ import urllib.request
 import urllib.error
 
 # ---------------------------------------------------------------------------
-# Konfiguration – ändra här om du vill bevaka en annan linje/hållplats/fönster
+# Konfiguration - en post per bevakning. Lägg till fler här vid behov.
 # ---------------------------------------------------------------------------
-STOP_NAME = "Sergels torg"
-LINE_DESIGNATION = "516"
-DESTINATION_MATCH = "Häggvik"  # substräng, skiftlägesokänslig
-WINDOW_START = dtime(15, 15)  # 15 min innan första avgången (15:30)
-WINDOW_END = dtime(18, 50)    # mäter en bit efter SCOPE_END, för att hinna
-                                # bekräfta utfallet för den sista avgången
-SCOPE_END = dtime(18, 30)     # avgångar planerade efter detta räknas inte
-                                # med i sammanfattningen - sista bussen går
-                                # 18:30 enligt tidtabellen
+WATCHES = [
+    {
+        "key": "afternoon",
+        "stop_name": "Sergels torg",
+        "line_designation": "516",
+        "destination_match": "Häggvik",  # substräng, skiftlägesokänslig
+        "window_start": dtime(15, 15),   # 15 min innan första avgången (15:30)
+        "window_end": dtime(18, 50),     # marginal efter scope_end för att
+                                          # hinna bekräfta sista avgången
+        "scope_end": dtime(18, 30),      # sista avgång vi räknar med
+    },
+    {
+        "key": "morning",
+        "stop_name": "Silverdals kapell",
+        "line_designation": "516",
+        "destination_match": "Sergels torg",
+        "window_start": dtime(5, 45),    # 15 min innan första avgången (06:00)
+        "window_end": dtime(9, 15),      # marginal efter scope_end
+        "scope_end": dtime(9, 0),        # sista avgång vi räknar med
+    },
+]
 WEEKDAYS_ONLY = True  # mån-fre
 
 TZ = ZoneInfo("Europe/Stockholm")
@@ -56,11 +74,17 @@ BASE_URL = "https://transport.integration.sl.se/v1"
 
 ROOT = Path(__file__).parent
 DATA_DIR = ROOT / "data"
-RAW_DIR = DATA_DIR / "raw"
-SITE_CACHE_FILE = DATA_DIR / "site_cache.json"
-SUMMARY_FILE = DATA_DIR / "summary.csv"
+SITE_CACHE_FILE = DATA_DIR / "site_cache.json"  # delad mellan bevakningar
 
-RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+def raw_dir_for(watch_key: str) -> Path:
+    d = DATA_DIR / watch_key / "raw"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def summary_file_for(watch_key: str) -> Path:
+    return DATA_DIR / watch_key / "summary.csv"
 
 
 def http_get_json(url: str, attempts: int = 3, backoff_seconds: float = 5.0):
@@ -81,7 +105,9 @@ def http_get_json(url: str, attempts: int = 3, backoff_seconds: float = 5.0):
 
 
 def get_site_id(stop_name: str) -> int:
-    """Slår upp siteId för en hållplats, med enkel fil-cache."""
+    """Slår upp siteId för en hållplats, med enkel fil-cache (delad för
+    alla bevakningar)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     if SITE_CACHE_FILE.exists():
         cache = json.loads(SITE_CACHE_FILE.read_text())
         if stop_name in cache:
@@ -96,7 +122,6 @@ def get_site_id(stop_name: str) -> int:
             match = site
             break
     if match is None:
-        # fallback: substräng-matchning om exakt namn inte hittas
         for site in sites:
             if stop_name.strip().lower() in site.get("name", "").strip().lower():
                 match = site
@@ -109,27 +134,32 @@ def get_site_id(stop_name: str) -> int:
     return match["id"]
 
 
-def in_monitoring_window(now_local: datetime) -> bool:
+def in_monitoring_window(now_local: datetime, watch: dict) -> bool:
     if WEEKDAYS_ONLY and now_local.weekday() >= 5:  # 5=lör, 6=sön
         return False
-    return WINDOW_START <= now_local.time() <= WINDOW_END
+    return watch["window_start"] <= now_local.time() <= watch["window_end"]
 
 
-def fetch_matching_departures(site_id: int):
+def fetch_matching_departures(site_id: int, watch: dict):
     payload = http_get_json(f"{BASE_URL}/sites/{site_id}/departures")
     out = []
     for dep in payload.get("departures", []):
         line = dep.get("line", {}) or {}
         designation = str(line.get("designation") or line.get("name") or "")
-        destination = str(dep.get("destination") or "")
-        if designation.strip() == LINE_DESIGNATION and DESTINATION_MATCH.lower() in destination.lower():
-            out.append(dep)
+        if designation.strip() != watch["line_designation"]:
+            continue
+        dest_match = watch["destination_match"]
+        if dest_match:
+            destination = str(dep.get("destination") or "")
+            if dest_match.lower() not in destination.lower():
+                continue
+        out.append(dep)
     return out
 
 
-def append_raw_rows(poll_time_local: datetime, departures: list):
+def append_raw_rows(poll_time_local: datetime, departures: list, watch_key: str):
     date_str = poll_time_local.strftime("%Y-%m-%d")
-    raw_file = RAW_DIR / f"{date_str}.csv"
+    raw_file = raw_dir_for(watch_key) / f"{date_str}.csv"
     is_new = not raw_file.exists()
     with raw_file.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -141,9 +171,8 @@ def append_raw_rows(poll_time_local: datetime, departures: list):
         if not departures:
             # Skriv ändå en "hjärtslag"-rad så vi vet att en mätning
             # faktiskt gjordes vid den här tidpunkten, även om inga
-            # matchande avgångar syntes just då. Det är avgörande för att
-            # senare kunna avgöra om en avgång verkligen försvann eller om
-            # vi bara inte hann mäta i tid (se classify_day).
+            # matchande avgångar syntes just då. Avgörande för att kunna
+            # avgöra om en avgång verkligen försvann (se classify_day).
             writer.writerow([
                 poll_time_local.isoformat(timespec="seconds"),
                 "_HEARTBEAT_", "", "", "", "", "",
@@ -162,28 +191,16 @@ def append_raw_rows(poll_time_local: datetime, departures: list):
     return raw_file
 
 
-def classify_day(date_str: str):
-    """Läser dagens raw-fil och klassar varje unik schemalagd avgång.
-
-    Metod: för varje avgång som slutar synas i tavlan INNAN sin egen
-    förväntade avgångstid, kollar vi om det faktiskt gjordes en ny mätning
-    EFTER den tidpunkten (oavsett hur långt senare - GitHub Actions kör
-    inte alltid exakt var 3:e minut). Om avgången fortfarande saknades vid
-    den mätningen har vi goda belägg för att den verkligen försvann. Om
-    ingen mätning hann göras efter dess avgångstid innan fönstret stängde
-    kan vi inte veta säkert, och den märks UNCERTAIN istället för att
-    gissa.
-    """
-    raw_file = RAW_DIR / f"{date_str}.csv"
+def classify_day(date_str: str, watch: dict):
+    """Läser dagens raw-fil för en bevakning och klassar varje unik
+    schemalagd avgång. Se modulens docstring för metodbeskrivning."""
+    raw_file = raw_dir_for(watch["key"]) / f"{date_str}.csv"
     if not raw_file.exists():
         return []
 
-    all_rows = []
     with raw_file.open(newline="", encoding="utf-8") as f:
         all_rows = list(csv.DictReader(f))
 
-    # Alla tidpunkter då en mätning verkligen gjordes (oavsett om något
-    # matchade), oavsett hur oregelbundet GitHub kört dem.
     poll_times = sorted({
         datetime.fromisoformat(r["poll_time"]) for r in all_rows
     })
@@ -195,6 +212,7 @@ def classify_day(date_str: str):
         by_scheduled.setdefault(row["scheduled"], []).append(row)
 
     now_local = datetime.now(TZ)
+    scope_end = watch["scope_end"]
     results = []
     for sched, rows in sorted(by_scheduled.items()):
         try:
@@ -202,18 +220,10 @@ def classify_day(date_str: str):
         except ValueError:
             sched_dt = None
 
-        if sched_dt and sched_dt.time() > SCOPE_END:
-            # Ligger utanför det fönster vi faktiskt bevakar (t.ex. en
-            # avgång kl 18:30 som bara syntes för att tavlan tittar en bit
-            # framåt i tiden) - tas inte med i sammanfattningen.
+        if sched_dt and sched_dt.time() > scope_end:
             continue
 
         states_seen = [r["state"] for r in rows]
-        # De här tre statusarna är rimligen bokstavliga fysiska observationer
-        # (fordonet sågs vid hållplatsen / lämnade den / passerade den) -
-        # till skillnad från t.ex. EXPECTED som bara är en prognos. OBS:
-        # SL:s egen dokumentation förklarar inte formellt vad ATSTOP innebär,
-        # så det här är en indikation, inte en garanterad bekräftelse.
         physically_confirmed = any(
             s in ("ATSTOP", "DEPARTED", "PASSED") for s in states_seen
         )
@@ -231,8 +241,6 @@ def classify_day(date_str: str):
         elif sched_dt and sched_dt > now_local:
             outcome = "PENDING"
         elif last_expected_dt and last_seen_dt >= last_expected_dt - timedelta(minutes=2):
-            # Sågs ända fram till (eller nästan fram till) sin egen
-            # förväntade avgångstid - stark signal att den faktiskt gick.
             delay_min = None
             if sched_dt and last_expected_dt:
                 delay_min = round((last_expected_dt - sched_dt).total_seconds() / 60)
@@ -241,8 +249,6 @@ def classify_day(date_str: str):
             else:
                 outcome = "RAN_ON_TIME"
         else:
-            # Försvann innan sin egen förväntade tid. Kolla om vi hann
-            # mäta igen EFTER den tidpunkten innan fönstret stängde.
             later_polls = [t for t in poll_times if last_expected_dt and t > last_expected_dt]
             if later_polls:
                 outcome = "VANISHED"
@@ -261,54 +267,66 @@ def classify_day(date_str: str):
     return results
 
 
-def rewrite_summary_for_date(date_str: str):
-    new_rows = classify_day(date_str)
+SUMMARY_FIELDNAMES = [
+    "date", "scheduled", "first_seen", "last_seen",
+    "last_state", "outcome", "physically_confirmed",
+]
+
+
+def rewrite_summary_for_date(date_str: str, watch: dict):
+    new_rows = classify_day(date_str, watch)
     if not new_rows:
         return
 
+    summary_file = summary_file_for(watch["key"])
     existing = []
-    if SUMMARY_FILE.exists():
-        with SUMMARY_FILE.open(newline="", encoding="utf-8") as f:
+    if summary_file.exists():
+        with summary_file.open(newline="", encoding="utf-8") as f:
             existing = list(csv.DictReader(f))
 
     existing = [r for r in existing if r["date"] != date_str]
     existing.extend(new_rows)
     existing.sort(key=lambda r: (r["date"], r["scheduled"]))
 
-    with SUMMARY_FILE.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["date", "scheduled", "first_seen", "last_seen", "last_state", "outcome", "physically_confirmed"])
+    summary_file.parent.mkdir(parents=True, exist_ok=True)
+    with summary_file.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=SUMMARY_FIELDNAMES)
         writer.writeheader()
         writer.writerows(existing)
 
 
-def main():
-    now_local = datetime.now(TZ)
-
-    if not in_monitoring_window(now_local):
-        print(f"Utanför bevakningsfönstret ({now_local.isoformat()}) – gör inget.")
+def run_watch(now_local: datetime, watch: dict):
+    key = watch["key"]
+    if not in_monitoring_window(now_local, watch):
         return
 
     try:
-        site_id = get_site_id(STOP_NAME)
-        departures = fetch_matching_departures(site_id)
+        site_id = get_site_id(watch["stop_name"])
+        departures = fetch_matching_departures(site_id, watch)
     except RuntimeError as e:
-        # Ett konfigurationsfel (t.ex. hållplatsen hittades inte) - värt att
-        # synas som ett rött, riktigt fel.
-        print(f"Konfigurationsfel: {e}", file=sys.stderr)
+        print(f"[{key}] Konfigurationsfel: {e}", file=sys.stderr)
         sys.exit(1)
     except (urllib.error.URLError, urllib.error.HTTPError) as e:
-        # SL:s server svarade inte som förväntat även efter återförsök.
-        # Detta är ofta tillfälligt - vi loggar det tydligt men låter INTE
-        # hela jobbet räknas som misslyckat, eftersom nästa pollning om
-        # 3 minuter oftast löser det själv.
-        print(f"Kunde inte hämta data från SL just nu, hoppar över denna pollning: {e}")
+        print(f"[{key}] Kunde inte hämta data från SL just nu, hoppar över denna pollning: {e}")
         return
 
-    raw_file = append_raw_rows(now_local, departures)
-    print(f"Loggade {len(departures)} matchande avgångar till {raw_file}")
+    raw_file = append_raw_rows(now_local, departures, key)
+    print(f"[{key}] Loggade {len(departures)} matchande avgångar till {raw_file}")
 
-    rewrite_summary_for_date(now_local.strftime("%Y-%m-%d"))
-    print("Uppdaterade data/summary.csv")
+    rewrite_summary_for_date(now_local.strftime("%Y-%m-%d"), watch)
+    print(f"[{key}] Uppdaterade {summary_file_for(key)}")
+
+
+def main():
+    now_local = datetime.now(TZ)
+    any_active = False
+    for watch in WATCHES:
+        if in_monitoring_window(now_local, watch):
+            any_active = True
+        run_watch(now_local, watch)
+
+    if not any_active:
+        print(f"Utanför alla bevakningsfönster ({now_local.isoformat()}) - gjorde inget.")
 
 
 if __name__ == "__main__":
