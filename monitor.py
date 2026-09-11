@@ -201,8 +201,15 @@ def classify_day(date_str: str, watch: dict):
     with raw_file.open(newline="", encoding="utf-8") as f:
         all_rows = list(csv.DictReader(f))
 
-    poll_times = sorted({
+    # Bara pollningar som faktiskt returnerade minst en avgång räknas som
+    # tillförlitligt "vi kollade och den var borta"-bevis. En helt tom
+    # mätning (bara en _HEARTBEAT_-rad, noll avgångar alls för linjen) är
+    # ofta ett tillfälligt hack hos SL:s API snarare än att alla avgångar
+    # verkligen försvann samtidigt - den räknas därför INTE som bevis för
+    # VANISHED, bara som att en mätning gjordes (syns ändå i raw-filen).
+    confirmed_poll_times = sorted({
         datetime.fromisoformat(r["poll_time"]) for r in all_rows
+        if r["scheduled"] != "_HEARTBEAT_"
     })
 
     by_scheduled = {}
@@ -249,7 +256,7 @@ def classify_day(date_str: str, watch: dict):
             else:
                 outcome = "RAN_ON_TIME"
         else:
-            later_polls = [t for t in poll_times if last_expected_dt and t > last_expected_dt]
+            later_polls = [t for t in confirmed_poll_times if last_expected_dt and t > last_expected_dt]
             if later_polls:
                 outcome = "VANISHED"
             else:
