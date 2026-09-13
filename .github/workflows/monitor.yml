@@ -30,5 +30,21 @@ jobs:
           git config user.name "sl-516-monitor-bot"
           git config user.email "actions@users.noreply.github.com"
           git add data/
-          git diff --cached --quiet || git commit -m "Logg: $(date -u +'%Y-%m-%d %H:%M UTC')"
-          git push
+          if git diff --cached --quiet; then
+            echo "Inget att committa."
+            exit 0
+          fi
+          git commit -m "Logg: $(date -u +'%Y-%m-%d %H:%M UTC')"
+          # Om en annan körning hann pusha före oss (två jobb nästan
+          # samtidigt), hämta in deras ändringar och försök igen - upp
+          # till 5 gånger med kort väntetid mellan.
+          for i in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push misslyckades (försök $i/5), hämtar nya ändringar och försöker igen..."
+            git pull --rebase
+            sleep $((RANDOM % 5 + 1))
+          done
+          echo "Gav upp efter 5 försök."
+          exit 1
