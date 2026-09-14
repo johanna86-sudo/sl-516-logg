@@ -247,7 +247,7 @@ def classify_day(date_str: str, watch: dict):
             outcome = "CANCELLED"
         elif sched_dt and sched_dt > now_local:
             outcome = "PENDING"
-        elif last_expected_dt and last_seen_dt >= last_expected_dt - timedelta(minutes=2):
+        elif last_expected_dt and last_seen_dt >= last_expected_dt - timedelta(minutes=20):
             delay_min = None
             if sched_dt and last_expected_dt:
                 delay_min = round((last_expected_dt - sched_dt).total_seconds() / 60)
@@ -257,8 +257,10 @@ def classify_day(date_str: str, watch: dict):
                 outcome = "RAN_ON_TIME"
         else:
             later_polls = [t for t in confirmed_poll_times if last_expected_dt and t > last_expected_dt]
-            if later_polls:
-                outcome = "VANISHED"
+            if len(later_polls) >= 2:
+                outcome = "VANISHED_CONFIRMED"
+            elif len(later_polls) == 1:
+                outcome = "VANISHED_LIKELY"
             else:
                 outcome = "UNCERTAIN_WINDOW_ENDED"
 
