@@ -258,7 +258,7 @@ def classify_day(date_str: str, watch: dict):
             # om den bara "hängde kvar" på tavlan fram till Nu och sedan
             # försvann tyst - precis det mönster du beskrivit.
             if physically_confirmed:
-                outcome = "RAN_CONFIRMED"
+                outcome = "RAN_CONFIRMED" if not delay_min or delay_min <= 2 else f"RAN_CONFIRMED_DELAYED_{delay_min}min"
             elif delay_min is not None and delay_min > 2:
                 outcome = f"RAN_LIKELY_DELAYED_{delay_min}min"
             else:
