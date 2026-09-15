@@ -251,10 +251,18 @@ def classify_day(date_str: str, watch: dict):
             delay_min = None
             if sched_dt and last_expected_dt:
                 delay_min = round((last_expected_dt - sched_dt).total_seconds() / 60)
-            if delay_min is not None and delay_min > 2:
-                outcome = f"RAN_DELAYED_{delay_min}min"
+
+            # Sågs den nära sin avgångstid MED fysisk bekräftelse
+            # (ATSTOP/DEPARTED/PASSED)? Det är den enda riktigt säkra
+            # RAN-signalen. Utan den vet vi inte om den faktiskt kom, eller
+            # om den bara "hängde kvar" på tavlan fram till Nu och sedan
+            # försvann tyst - precis det mönster du beskrivit.
+            if physically_confirmed:
+                outcome = "RAN_CONFIRMED"
+            elif delay_min is not None and delay_min > 2:
+                outcome = f"RAN_LIKELY_DELAYED_{delay_min}min"
             else:
-                outcome = "RAN_ON_TIME"
+                outcome = "RAN_LIKELY"
         else:
             later_polls = [t for t in confirmed_poll_times if last_expected_dt and t > last_expected_dt]
             if len(later_polls) >= 2:
@@ -304,6 +312,32 @@ def rewrite_summary_for_date(date_str: str, watch: dict):
         writer.writerows(existing)
 
 
+BURST_LOOKAHEAD_MINUTES = 6   # om en avgång väntas inom så här lång tid,
+                               # gå in i intensivläge
+BURST_INTERVAL_SECONDS = 30   # hur ofta vi mäter under intensivläget
+BURST_DURATION_SECONDS = 300  # hur länge intensivläget pågår (5 min)
+
+
+def has_imminent_departure(now_local: datetime, departures: list) -> bool:
+    """Sant om någon avgång väntas inom BURST_LOOKAHEAD_MINUTES - det är då
+    "försvinner tyst vid Nu"-mönstret faktiskt inträffar, så vi vill mäta
+    tätare just runt den stunden."""
+    for dep in departures:
+        expected_raw = dep.get("expected") or dep.get("scheduled")
+        if not expected_raw:
+            continue
+        try:
+            expected_dt = datetime.fromisoformat(expected_raw)
+            if expected_dt.tzinfo is None:
+                expected_dt = expected_dt.replace(tzinfo=TZ)
+        except ValueError:
+            continue
+        minutes_left = (expected_dt - now_local).total_seconds() / 60
+        if -1 <= minutes_left <= BURST_LOOKAHEAD_MINUTES:
+            return True
+    return False
+
+
 def run_watch(now_local: datetime, watch: dict):
     key = watch["key"]
     if not in_monitoring_window(now_local, watch):
@@ -321,6 +355,21 @@ def run_watch(now_local: datetime, watch: dict):
 
     raw_file = append_raw_rows(now_local, departures, key)
     print(f"[{key}] Loggade {len(departures)} matchande avgångar till {raw_file}")
+
+    if has_imminent_departure(now_local, departures):
+        print(f"[{key}] Avgång nära förestående - går in i intensivläge ({BURST_DURATION_SECONDS}s, var {BURST_INTERVAL_SECONDS}s).")
+        elapsed = 0
+        while elapsed < BURST_DURATION_SECONDS:
+            time.sleep(BURST_INTERVAL_SECONDS)
+            elapsed += BURST_INTERVAL_SECONDS
+            burst_now = datetime.now(TZ)
+            try:
+                burst_departures = fetch_matching_departures(site_id, watch)
+            except (urllib.error.URLError, urllib.error.HTTPError) as e:
+                print(f"[{key}] Intensivmätning misslyckades, hoppar över: {e}")
+                continue
+            append_raw_rows(burst_now, burst_departures, key)
+        print(f"[{key}] Intensivläge klart.")
 
     rewrite_summary_for_date(now_local.strftime("%Y-%m-%d"), watch)
     print(f"[{key}] Uppdaterade {summary_file_for(key)}")
