@@ -2,12 +2,22 @@ name: Logga buss 516 (morgon + eftermiddag)
 
 on:
   schedule:
-    # Var 5:e minut, 03:00-08:59 och 13:00-18:59 UTC, mån-fre.
-    # Täcker morgonfönstret 05:45-09:15 och eftermiddagsfönstret 15:15-18:50
-    # lokal tid, oavsett sommar-/vintertid — exakt filtrering sker sedan
-    # per bevakning inuti monitor.py (se WATCHES).
-    - cron: "*/5 3-8,13-18 * * 1-5"
+    # GitHub startar inte alla schemalagda körningar, så vi ger det många
+    # chanser: ett startförsök var 15:e minut under de timmar (UTC) som
+    # täcker båda fönstren, sommar- och vintertid. Skriptet pollar sedan
+    # självt under hela fönstret, så det räcker att ETT försök lyckas.
+    #   Morgon      05:45-09:15 lokal tid = ca 03-08 UTC
+    #   Eftermiddag 15:15-18:50 lokal tid = ca 13-18 UTC
+    # Försöken börjar ca 2 h före fönstren - startar ett jobb tidigt väntar
+    # skriptet in fönstret (se PRESTART_WAIT_MINUTES i monitor.py).
+    - cron: "*/15 2-8,11-17 * * 1-5"
   workflow_dispatch: {}  # gör det möjligt att köra manuellt för test
+
+# Bara en körning åt gången. Extra startförsök köas i stället för att köras
+# parallellt (och avslutar direkt om fönstret redan är klart).
+concurrency:
+  group: sl-516-monitor
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -15,6 +25,7 @@ permissions:
 jobs:
   poll:
     runs-on: ubuntu-latest
+    timeout-minutes: 355  # strax över MAX_RUNTIME i monitor.py, under GitHubs gräns på 360
     steps:
       - uses: actions/checkout@v4
 
@@ -22,10 +33,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Kör mätning
+      - name: Kör mätning (pollar själv genom hela fönstret)
         run: python monitor.py
 
+      # Skriptet pushar själv var 10:e minut. Det här steget är reserv så att
+      # sista datat sparas även om något avbryts.
       - name: Committa ny data (om något ändrats)
+        if: always()
         run: |
           git config user.name "sl-516-monitor-bot"
           git config user.email "actions@users.noreply.github.com"
@@ -35,15 +49,12 @@ jobs:
             exit 0
           fi
           git commit -m "Logg: $(date -u +'%Y-%m-%d %H:%M UTC')"
-          # Om en annan körning hann pusha före oss (två jobb nästan
-          # samtidigt), hämta in deras ändringar och försök igen - upp
-          # till 5 gånger med kort väntetid mellan.
           for i in 1 2 3 4 5; do
             if git push; then
               exit 0
             fi
             echo "Push misslyckades (försök $i/5), hämtar nya ändringar och försöker igen..."
-            git pull --rebase
+            git pull --rebase --autostash
             sleep $((RANDOM % 5 + 1))
           done
           echo "Gav upp efter 5 försök."
