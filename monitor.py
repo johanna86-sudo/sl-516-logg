@@ -7,8 +7,11 @@ Loggar avgångar för buss 516, i två riktningar:
 Använder SL:s öppna "Transport"-API (inget API-nyckel behövs):
 https://www.trafiklab.se/api/our-apis/sl/transport/
 
-Körs en gång per anrop (triggas av ett schemalagt GitHub Actions-jobb).
-Skriptet:
+Körs som en "session": GitHub Actions startar skriptet någon gång kring ett
+bevakningsfönster, och skriptet pollar sedan självt (var 60:e sekund, var
+30:e när en avgång är nära) tills fönstret stängt, och pushar data var 10:e
+minut. Det gör att det räcker att GitHub startar jobbet en enda gång per
+fönster. Skriptet:
   1. Går igenom varje bevakning i WATCHES. Struntar i en bevakning om
      klockan i Stockholm inte är inom just dess fönster just nu.
   2. Slår upp siteId för hållplatsen (cachas i data/site_cache.json,
@@ -34,9 +37,11 @@ Skriptet:
 import csv
 import json
 import os
+import random
+import subprocess
 import sys
 import time
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, timezone, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -312,15 +317,31 @@ def rewrite_summary_for_date(date_str: str, watch: dict):
         writer.writerows(existing)
 
 
-BURST_LOOKAHEAD_MINUTES = 6   # om en avgång väntas inom så här lång tid,
-                               # gå in i intensivläge
-BURST_INTERVAL_SECONDS = 30   # hur ofta vi mäter under intensivläget
-BURST_DURATION_SECONDS = 300  # hur länge intensivläget pågår (5 min)
+
+
+# ---------------------------------------------------------------------------
+# Sessionsläge: EN körning pollar själv genom hela fönstret.
+#
+# Tidigare triggades ett nytt jobb var 5:e minut av GitHub. GitHub startar
+# dock inte alla schemalagda körningar (många hoppas över), vilket gav stora
+# luckor i datan. Nu räcker det att GitHub startar jobbet EN gång någonstans
+# kring fönstret - därefter sköter skriptet pollningen själv.
+# ---------------------------------------------------------------------------
+POLL_INTERVAL_SECONDS = 60        # normal mätfrekvens
+IMMINENT_INTERVAL_SECONDS = 30    # tätare när en avgång är nära
+IMMINENT_LOOKAHEAD_MINUTES = 6    # "nära" = väntas inom så här lång tid
+PRESTART_WAIT_MINUTES = 120       # om jobbet startar så här tidigt före ett
+                                   # fönster väntar det in fönstret. GitHub
+                                   # startar ofta jobben timmar för sent, så
+                                   # marginalen behöver vara stor.
+COMMIT_EVERY_SECONDS = 600        # spara/pusha data var 10:e minut
+MAX_RUNTIME_SECONDS = 345 * 60    # säkerhetsgräns: 2 h väntan + 3 h 35 min
+                                   # fönster ryms, under GitHubs 6 h-gräns
 
 
 def has_imminent_departure(now_local: datetime, departures: list) -> bool:
-    """Sant om någon avgång väntas inom BURST_LOOKAHEAD_MINUTES - det är då
-    "försvinner tyst vid Nu"-mönstret faktiskt inträffar, så vi vill mäta
+    """Sant om någon avgång väntas inom IMMINENT_LOOKAHEAD_MINUTES - det är
+    då "försvinner tyst vid Nu"-mönstret faktiskt inträffar, så vi vill mäta
     tätare just runt den stunden."""
     for dep in departures:
         expected_raw = dep.get("expected") or dep.get("scheduled")
@@ -333,58 +354,120 @@ def has_imminent_departure(now_local: datetime, departures: list) -> bool:
         except ValueError:
             continue
         minutes_left = (expected_dt - now_local).total_seconds() / 60
-        if -1 <= minutes_left <= BURST_LOOKAHEAD_MINUTES:
+        if -1 <= minutes_left <= IMMINENT_LOOKAHEAD_MINUTES:
             return True
     return False
 
 
-def run_watch(now_local: datetime, watch: dict):
-    key = watch["key"]
-    if not in_monitoring_window(now_local, watch):
+def git_sync(message_prefix: str = "Logg"):
+    """Committar och pushar data/ - bara när skriptet körs i GitHub Actions.
+    Fel här får aldrig stoppa mätningen; det slutliga commit-steget i
+    workflowen är reserv."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
         return
-
     try:
-        site_id = get_site_id(watch["stop_name"])
-        departures = fetch_matching_departures(site_id, watch)
-    except RuntimeError as e:
-        print(f"[{key}] Konfigurationsfel: {e}", file=sys.stderr)
-        sys.exit(1)
-    except (urllib.error.URLError, urllib.error.HTTPError) as e:
-        print(f"[{key}] Kunde inte hämta data från SL just nu, hoppar över denna pollning: {e}")
+        subprocess.run(["git", "config", "user.name", "sl-516-monitor-bot"], check=True)
+        subprocess.run(["git", "config", "user.email", "actions@users.noreply.github.com"], check=True)
+        subprocess.run(["git", "add", "data/"], check=True)
+        if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 0:
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        subprocess.run(["git", "commit", "-m", f"{message_prefix}: {stamp}"], check=True)
+        for attempt in range(1, 6):
+            if subprocess.run(["git", "push"]).returncode == 0:
+                print("Pushade data till GitHub.")
+                return
+            print(f"Push misslyckades (försök {attempt}/5), hämtar ändringar och försöker igen...")
+            subprocess.run(["git", "pull", "--rebase", "--autostash"])
+            time.sleep(random.randint(1, 5))
+        print("Gav upp att pusha den här gången - nästa försök sker om en stund.")
+    except Exception as e:  # noqa: BLE001 - får aldrig stoppa mätningen
+        print(f"git_sync misslyckades: {e}")
+
+
+def run_session(now_fn=None, sleep_fn=None, fetch_fn=None, sync_fn=None):
+    """Pollar alla bevakningar i ett svep tills alla fönster har stängt.
+    Parametrarna finns för att kunna testa med falsk klocka/falska svar."""
+    now_fn = now_fn or (lambda: datetime.now(TZ))
+    sleep_fn = sleep_fn or time.sleep
+    fetch_fn = fetch_fn or fetch_matching_departures
+    sync_fn = sync_fn or git_sync
+
+    start = now_fn()
+    if WEEKDAYS_ONLY and start.weekday() >= 5:
+        print(f"Helg ({start.isoformat()}) - gjorde inget.")
         return
 
-    raw_file = append_raw_rows(now_local, departures, key)
-    print(f"[{key}] Loggade {len(departures)} matchande avgångar till {raw_file}")
+    def window_soon_or_active(now):
+        for w in WATCHES:
+            if in_monitoring_window(now, w):
+                return True
+            ws = datetime.combine(now.date(), w["window_start"], tzinfo=TZ)
+            if now < ws <= now + timedelta(minutes=PRESTART_WAIT_MINUTES):
+                return True
+        return False
 
-    if has_imminent_departure(now_local, departures):
-        print(f"[{key}] Avgång nära förestående - går in i intensivläge ({BURST_DURATION_SECONDS}s, var {BURST_INTERVAL_SECONDS}s).")
-        elapsed = 0
-        while elapsed < BURST_DURATION_SECONDS:
-            time.sleep(BURST_INTERVAL_SECONDS)
-            elapsed += BURST_INTERVAL_SECONDS
-            burst_now = datetime.now(TZ)
-            try:
-                burst_departures = fetch_matching_departures(site_id, watch)
-            except (urllib.error.URLError, urllib.error.HTTPError) as e:
-                print(f"[{key}] Intensivmätning misslyckades, hoppar över: {e}")
+    if not window_soon_or_active(start):
+        print(f"Utanför alla bevakningsfönster ({start.isoformat()}) - gjorde inget.")
+        return
+
+    site_ids = {}
+    touched = set()   # (datum, bevakningsnyckel)
+    watch_by_key = {w["key"]: w for w in WATCHES}
+    last_sync = start
+    polls = 0
+
+    def finalize():
+        for date_str, key in sorted(touched):
+            rewrite_summary_for_date(date_str, watch_by_key[key])
+        sync_fn()
+
+    while True:
+        now = now_fn()
+        if (now - start).total_seconds() > MAX_RUNTIME_SECONDS:
+            print("Nådde maxtid - avslutar.")
+            break
+
+        active = [w for w in WATCHES if in_monitoring_window(now, w)]
+        if not active:
+            if window_soon_or_active(now):
+                sleep_fn(30)   # väntar in nästa fönster
                 continue
-            append_raw_rows(burst_now, burst_departures, key)
-        print(f"[{key}] Intensivläge klart.")
+            break              # alla fönster är klara
 
-    rewrite_summary_for_date(now_local.strftime("%Y-%m-%d"), watch)
-    print(f"[{key}] Uppdaterade {summary_file_for(key)}")
+        imminent = False
+        for watch in active:
+            key = watch["key"]
+            try:
+                if key not in site_ids:
+                    site_ids[key] = get_site_id(watch["stop_name"])
+                departures = fetch_fn(site_ids[key], watch)
+            except RuntimeError as e:
+                print(f"[{key}] Konfigurationsfel: {e}", file=sys.stderr)
+                finalize()
+                sys.exit(1)
+            except (OSError, ValueError) as e:   # nätverk, HTTP, trasig JSON
+                print(f"[{key}] Kunde inte hämta data från SL just nu, hoppar över: {e}")
+                continue
+
+            append_raw_rows(now, departures, key)
+            touched.add((now.strftime("%Y-%m-%d"), key))
+            polls += 1
+            if has_imminent_departure(now, departures):
+                imminent = True
+
+        if (now - last_sync).total_seconds() >= COMMIT_EVERY_SECONDS:
+            finalize()
+            last_sync = now
+
+        sleep_fn(IMMINENT_INTERVAL_SECONDS if imminent else POLL_INTERVAL_SECONDS)
+
+    finalize()
+    print(f"Klart: {polls} mätningar gjorda under den här körningen.")
 
 
 def main():
-    now_local = datetime.now(TZ)
-    any_active = False
-    for watch in WATCHES:
-        if in_monitoring_window(now_local, watch):
-            any_active = True
-        run_watch(now_local, watch)
-
-    if not any_active:
-        print(f"Utanför alla bevakningsfönster ({now_local.isoformat()}) - gjorde inget.")
+    run_session()
 
 
 if __name__ == "__main__":
